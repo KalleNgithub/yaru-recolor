@@ -1,0 +1,440 @@
+#!/usr/bin/env bash
+# yaru-recolor — rebuild Yaru cursors with custom colors. See --help for details.
+
+set -euo pipefail
+
+show_help() {
+  cat <<'HELP'
+yaru-recolor — rebuild Yaru cursors with custom colors.
+
+Usage:
+  yaru-recolor [fill=#RRGGBB] [border=#RRGGBB] [highlight=#RRGGBB]
+               [shading=#RRGGBB] [shadow=#RRGGBB]
+               [--workers=N] [--no-apply] [--colors] [-h|--help]
+
+Source PNGs:   bundled `yaru-sources/` (see README); override with
+               $YARU_RECOLOR_SOURCES if you want a custom path.
+Output theme:  ~/.icons/YaruRecolored
+Apply with:    gsettings set org.gnome.desktop.interface cursor-theme YaruRecolored
+
+Color slots:
+  fill       opaque dark-gray cursor body (matches Yaru's #313131 gradient)
+  border     opaque black outline
+  highlight  opaque near-white edge accent on the cursor body
+  shading    interior dark shadow effect (semi-transparent, alpha >= 128)
+  shadow     drop shadow around the cursor (semi-transparent, alpha < 128)
+
+Auto-defaults when a slot is omitted (computed once, before processing):
+  highlight  is set to  fill blended 30% toward white
+  shadow     is set to  border
+  shading    is set to  the resolved shadow value
+             (so shading ends up matching shadow unless you set shading
+              explicitly; if you set neither shading nor shadow, both fall
+              through to border)
+
+  Any slot still empty after these defaults is left untouched in the cursor.
+  Example: if you pass only fill=#FF1493, border stays Yaru's black, shadow
+  stays unchanged (because border wasn't set), highlight becomes the
+  lightened pink, shading stays unchanged.
+
+Other flags:
+  --colors      print a palette of suggested fill+border combos
+  --workers=N   parallel workers (default: min(nproc, 8))
+  --no-apply    don't run gsettings to switch the active theme
+  --reset       restore the cursor theme to whatever was active before the
+                last apply (or 'Yaru' if no prior value was saved). Does not
+                rebuild or delete the YaruRecolored theme directory.
+  -h, --help    this message
+HELP
+}
+
+# Locate the bundled Yaru cursor source dir (extracted PNGs + .conf per cursor).
+# Override with $YARU_RECOLOR_SOURCES. Otherwise check standard install spots,
+# falling back to a sibling `yaru-sources/` next to the script (running from
+# the unpacked tarball without installing).
+discover_source_dir() {
+  if [[ -n "${YARU_RECOLOR_SOURCES:-}" ]]; then
+    echo "$YARU_RECOLOR_SOURCES"; return
+  fi
+  local script_dir; script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+  for dir in \
+    "$HOME/.local/share/yaru-recolor/yaru-sources" \
+    "/usr/local/share/yaru-recolor/yaru-sources" \
+    "/usr/share/yaru-recolor/yaru-sources" \
+    "$script_dir/yaru-sources"
+  do
+    [[ -d "$dir" ]] && { echo "$dir"; return; }
+  done
+  # Not finding a source dir isn't a startup error — the caller validates
+  # SOURCE_DIR after arg parsing so `--help`/`--reset`/`--colors` still work.
+  return 0
+}
+SOURCE_DIR="$(discover_source_dir)"
+TARGET_DIR="$HOME/.icons/YaruRecolored"
+FUZZ="10%"
+
+FILL=""
+BORDER=""
+HIGHLIGHT=""
+SHADING=""
+SHADOW=""
+APPLY=1
+WORKERS=""
+
+# 24-bit ANSI color swatch: "   " (3 spaces) with hex background.
+swatch() {
+  local hex="${1#\#}"
+  local r=$((16#${hex:0:2})) g=$((16#${hex:2:2})) b=$((16#${hex:4:2}))
+  printf '\033[48;2;%d;%d;%dm   \033[0m' "$r" "$g" "$b"
+}
+
+# mix_hex RATIO HEX1 HEX2 → HEX  (= ratio*HEX1 + (1-ratio)*HEX2, ratio in [0,1])
+mix_hex() {
+  local ratio="$1" h1="${2#\#}" h2="${3#\#}"
+  local r1=$((16#${h1:0:2})) g1=$((16#${h1:2:2})) b1=$((16#${h1:4:2}))
+  local r2=$((16#${h2:0:2})) g2=$((16#${h2:2:2})) b2=$((16#${h2:4:2}))
+  awk -v a="$ratio" -v r1="$r1" -v g1="$g1" -v b1="$b1" -v r2="$r2" -v g2="$g2" -v b2="$b2" \
+    'BEGIN{printf "#%02X%02X%02X", a*r1+(1-a)*r2, a*g1+(1-a)*g2, a*b1+(1-a)*b2}'
+}
+
+show_palette() {
+  echo "Suggested combos. Run e.g.  yaru-recolor fill=#FF1493 border=#2CFF05"
+  echo
+  while IFS=$'\t' read -r fill border name; do
+    [[ -z "$fill" ]] && continue
+    printf '  '; swatch "$fill"
+    printf ' fill %s   ' "$fill"
+    swatch "$border"
+    printf ' border %s   %s\n' "$border" "$name"
+  done <<'EOF'
+#FF1493	#2CFF05	hot pink + neon green
+#2CFF05	#FF1493	neon green + hot pink
+#FF00FF	#00FFFF	magenta + cyan
+#FFFF00	#000000	yellow + black (high contrast)
+#FFFFFF	#FF0000	white + red
+#000000	#FFFF00	black + yellow
+#E95420	#FFFFFF	Ubuntu orange + white
+EOF
+}
+
+do_reset() {
+  if ! command -v gsettings >/dev/null; then
+    echo "gsettings not found; can't reset (not on a GNOME-y desktop?)." >&2
+    exit 1
+  fi
+  local prev_file="$TARGET_DIR/.previous-theme" prev="Yaru"
+  if [[ -r "$prev_file" ]]; then
+    prev="$(cat "$prev_file")"
+  fi
+  gsettings set org.gnome.desktop.interface cursor-theme "$prev"
+  echo "Cursor theme reset to '$prev'."
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    fill=*)      FILL="${arg#fill=}" ;;
+    border=*)    BORDER="${arg#border=}" ;;
+    highlight=*) HIGHLIGHT="${arg#highlight=}" ;;
+    shading=*)   SHADING="${arg#shading=}" ;;
+    shadow=*)    SHADOW="${arg#shadow=}" ;;
+    --workers=*) WORKERS="${arg#--workers=}" ;;
+    --no-apply)  APPLY=0 ;;
+    --colors)    show_palette; exit 0 ;;
+    --reset)     do_reset; exit 0 ;;
+    -h|--help)   show_help; exit 0 ;;
+    *) echo "Unknown arg: $arg" >&2; exit 1 ;;
+  esac
+done
+
+# Reject malformed colors before they reach mogrify (which would otherwise
+# emit a wall of one error per PNG before any sensible diagnostic).
+validate_hex() {
+  local slot=$1 value=$2
+  [[ -z "$value" ]] && return 0
+  if [[ ! "$value" =~ ^#[0-9A-Fa-f]{6}$ ]]; then
+    echo "Invalid color for $slot: '$value' — expected #RRGGBB with hex digits 0–9 / A–F." >&2
+    exit 1
+  fi
+}
+validate_hex fill      "$FILL"
+validate_hex border    "$BORDER"
+validate_hex highlight "$HIGHLIGHT"
+validate_hex shading   "$SHADING"
+validate_hex shadow    "$SHADOW"
+
+# Auto-derive any unset secondary colors from fill+border.
+# Order matters: SHADOW resolves before SHADING (since SHADING falls back to SHADOW).
+if [[ -z "$HIGHLIGHT" && -n "$FILL" ]]; then
+  HIGHLIGHT="$(mix_hex 0.3 "$FILL" "#FFFFFF")"  # 30% fill + 70% white
+fi
+if [[ -z "$SHADOW" && -n "$BORDER" ]]; then
+  SHADOW="$BORDER"
+fi
+if [[ -z "$SHADING" ]]; then
+  SHADING="${SHADOW:-${BORDER:-}}"
+fi
+
+# Default workers: nproc capped at 8 (more than that = diminishing returns
+# and a crowded terminal).
+if [[ -z "$WORKERS" ]]; then
+  WORKERS=$(nproc 2>/dev/null || echo 4)
+  (( WORKERS > 8 )) && WORKERS=8
+fi
+(( WORKERS < 1 )) && WORKERS=1
+
+if [[ -z "$FILL" && -z "$BORDER" && -z "$HIGHLIGHT" && -z "$SHADING" && -z "$SHADOW" ]]; then
+  echo "Usage: $(basename "$0") [fill=#RRGGBB] [border=#RRGGBB] [highlight=#RRGGBB] [shading=#RRGGBB] [shadow=#RRGGBB]" >&2
+  exit 1
+fi
+
+for tool in xcursorgen mogrify; do
+  command -v "$tool" >/dev/null || { echo "Missing: $tool" >&2; exit 1; }
+done
+
+if [[ -z "$SOURCE_DIR" || ! -d "$SOURCE_DIR" ]]; then
+  cat >&2 <<EOF
+Cursor source directory not found. The script expects pre-extracted Yaru
+cursor PNGs at one of:
+  \$YARU_RECOLOR_SOURCES (env)
+  ~/.local/share/yaru-recolor/yaru-sources
+  /usr/local/share/yaru-recolor/yaru-sources
+  /usr/share/yaru-recolor/yaru-sources
+  <script-dir>/yaru-sources
+See the README for the install step that drops them in place.
+EOF
+  exit 1
+fi
+
+WORK_DIR="$(mktemp -d)"
+trap 'rm -rf "$WORK_DIR"' EXIT
+
+# CLUT for shadow tinting. Built once at top level (not in cursor dirs, where the
+# glob `*.png` would otherwise pick it up alongside the cursor PNGs). Positions
+# 0-127 map to SHADOW, 128-255 map to SHADING.
+CLUT_PATH=""
+if [[ -n "$SHADING" || -n "$SHADOW" ]]; then
+  CLUT_PATH="$WORK_DIR/_clut.png"
+  CLUT_SH="${SHADING:-${SHADOW:-#000000}}"
+  CLUT_LO="${SHADOW:-${SHADING:-#000000}}"
+  convert \
+    \( -size 128x1 xc:"$CLUT_LO" \) \
+    \( -size 128x1 xc:"$CLUT_SH" \) \
+    +append "$CLUT_PATH"
+fi
+
+mkdir -p "$TARGET_DIR/cursors"
+
+cat > "$TARGET_DIR/index.theme" <<EOF
+[Icon Theme]
+Name=YaruRecolored
+Comment=Yaru recolored: fill=${FILL:-unchanged} border=${BORDER:-unchanged} highlight=${HIGHLIGHT:-unchanged} shading=${SHADING:-unchanged} shadow=${SHADOW:-unchanged}
+Inherits=Yaru
+EOF
+
+BAR_WIDTH=30
+BAR_FULL="##############################"
+BAR_EMPTY="..............................."
+
+# Per-worker bar color — rainbow pride stripes, red to violet. With fewer
+# workers we pick evenly-spaced entries from this palette so the endpoints
+# (red, violet) always show up and the missing colors come from the middle.
+PRIDE_PALETTE=(
+  '228 3 3'      # red
+  '255 140 0'    # orange
+  '255 237 0'    # yellow
+  '0 176 64'     # green
+  '0 192 192'    # cyan
+  '0 128 255'    # blue
+  '96 32 208'    # indigo
+  '160 64 176'   # violet
+)
+
+mapfile -t ALL_PATHS < <(find "$SOURCE_DIR" -mindepth 1 -maxdepth 1 | sort)
+TOTAL=${#ALL_PATHS[@]}
+(( WORKERS > TOTAL )) && WORKERS=$TOTAL
+
+# After WORKERS is final, pick one palette entry per worker.
+declare -a WORKER_COLOR
+ANSI_RESET=$'\033[0m'
+palette_size=${#PRIDE_PALETTE[@]}
+for ((i = 0; i < WORKERS; i++)); do
+  if (( WORKERS <= 1 )); then
+    idx=0
+  else
+    idx=$(( i * (palette_size - 1) / (WORKERS - 1) ))
+  fi
+  read -r r g b <<< "${PRIDE_PALETTE[$idx]}"
+  WORKER_COLOR[$i]=$(printf '\033[38;2;%d;%d;%dm' "$r" "$g" "$b")
+done
+
+STATUS_DIR="$WORK_DIR/status"
+SKIPPED_FILE="$WORK_DIR/skipped"
+mkdir -p "$STATUS_DIR"
+: > "$SKIPPED_FILE"
+
+# Round-robin partition: worker i gets paths at indices i, i+W, i+2W, ...
+declare -a WORKER_LISTS
+for ((i = 0; i < WORKERS; i++)); do WORKER_LISTS[$i]=""; done
+for i in "${!ALL_PATHS[@]}"; do
+  WORKER_LISTS[$(( i % WORKERS ))]+="${ALL_PATHS[$i]}"$'\n'
+done
+
+# Status format: "<done> <wtotal> <name>" — small atomic write per update.
+for w in $(seq 0 $((WORKERS - 1))); do
+  wt=$(printf '%s' "${WORKER_LISTS[$w]}" | grep -c .)
+  printf '0 %d -' "$wt" > "$STATUS_DIR/$w"
+done
+
+process_cursor() {
+  local cursor_path="$1"  # Directory: <SOURCE_DIR>/<name>/ with the .conf + per-size PNGs.
+  local name; name="$(basename "$cursor_path")"
+
+  [[ -d "$cursor_path" ]] || { echo "$name" >> "$SKIPPED_FILE"; return; }
+
+  local cdir="$WORK_DIR/$name"
+  mkdir -p "$cdir"
+  cp -a "$cursor_path"/. "$cdir/"
+  local conf="$cdir/$name.conf"
+  [[ -f "$conf" ]] || { echo "$name" >> "$SKIPPED_FILE"; return; }
+
+  # Pass 1: opaque-pixel recolors. Yaru's opaque palette:
+  #   border    = #000000  (outline)
+  #   fill      = #313131  (dark-gray body gradient; fuzz=10% catches the gradient)
+  #   highlight = near-white edge accent
+  # -opaque matches RGBA exactly, so semi-transparent #000000 shadow pixels
+  # are NOT touched here even though they share the border's RGB.
+  local -a mogrify_args=(-fuzz "$FUZZ")
+  [[ -n "$BORDER"    ]] && mogrify_args+=(-fill "$BORDER"    -opaque black)
+  [[ -n "$FILL"      ]] && mogrify_args+=(-fill "$FILL"      -opaque '#313131')
+  [[ -n "$HIGHLIGHT" ]] && mogrify_args+=(-fill "$HIGHLIGHT" -opaque white)
+  mogrify "${mogrify_args[@]}" "$cdir"/*.png
+
+  # Pass 2: semi-transparent shadow recolor. Yaru's drop shadow and interior
+  # shading are both pure-black pixels with alpha in (0,255). Pass 1 leaves
+  # them alone (RGB still #000000). Here we split by alpha:
+  #   alpha 128-254 → SHADING (interior darker patches)
+  #   alpha   1-127 → SHADOW  (outer drop shadow)
+  # via a 256x1 CLUT applied to the alpha channel, then masked to only the
+  # pixels that are currently #000000 with alpha<255 (i.e. originally shadow).
+  if [[ -n "$CLUT_PATH" ]]; then
+    for png in "$cdir"/*.png; do
+      tint_shadow "$png" "$CLUT_PATH"
+    done
+  fi
+
+  ( cd "$cdir" && xcursorgen "$conf" "$TARGET_DIR/cursors/$name" )
+}
+
+# Tint semi-transparent #000000 pixels in $1 using the alpha-keyed CLUT in $2.
+# Preserves each pixel's original alpha and leaves opaque pixels untouched.
+tint_shadow() {
+  local png="$1" clut="$2"
+  convert "$png" \
+    \( +clone -channel A -separate +channel \) \
+    \( -clone 1 "$clut" -clut \) \
+    \( -clone 0 -alpha off -fuzz 1% -fill white -opaque black -fill black +opaque white \) \
+    \( -clone 1 -threshold 99% -negate \) \
+    \( -clone 3 -clone 4 -alpha off -compose multiply -composite \) \
+    \( -clone 2 -clone 5 -alpha off -compose CopyOpacity -composite \) \
+    \( -clone 0 -clone 6 -compose Atop -composite \) \
+    -delete 0-6 \
+    "$png"
+}
+
+worker_loop() {
+  local id=$1
+  local count=0
+  local wtotal
+  wtotal=$(printf '%s' "${WORKER_LISTS[$id]}" | grep -c .)
+  while IFS= read -r cursor_path; do
+    [[ -z "$cursor_path" ]] && continue
+    count=$(( count + 1 ))
+    local name; name="$(basename "$cursor_path")"
+    printf '%d %d %s' "$count" "$wtotal" "$name" > "$STATUS_DIR/$id"
+    process_cursor "$cursor_path"
+  done <<< "${WORKER_LISTS[$id]}"
+  printf '%d %d done' "$wtotal" "$wtotal" > "$STATUS_DIR/$id"
+}
+
+render_bar_line() {
+  local label="$1" count="$2" wtotal="$3" name="$4" color="${5:-}"
+  local pct=0
+  (( wtotal > 0 )) && pct=$(( count * 100 / wtotal ))
+  local filled=$(( pct * BAR_WIDTH / 100 ))
+  local bar="${BAR_FULL:0:filled}${BAR_EMPTY:0:$((BAR_WIDTH - filled))}"
+  printf '%s [%s%s%s] %3d%% (%d/%d) %-30.30s\033[K\n' "$label" "$color" "$bar" "${color:+$ANSI_RESET}" "$pct" "$count" "$wtotal" "$name"
+}
+
+render_frame() {
+  # Move back to top of reserved block, then redraw all lines top-to-bottom.
+  printf '\033[%dA' "$((WORKERS + 1))"
+  local total_done=0
+  for w in $(seq 0 $((WORKERS - 1))); do
+    local line
+    line=$(cat "$STATUS_DIR/$w" 2>/dev/null || echo "0 0 -")
+    local count="${line%% *}" rest="${line#* }"
+    local wtotal="${rest%% *}" name="${rest#* }"
+    total_done=$(( total_done + count ))
+    render_bar_line "$(printf 'worker %d' "$w")" "$count" "$wtotal" "$name" "${WORKER_COLOR[$w]}"
+  done
+  render_bar_line "TOTAL   " "$total_done" "$TOTAL" ""
+}
+
+# Reserve (WORKERS + 1) lines for the render block.
+for _ in $(seq 1 $(( WORKERS + 1 ))); do echo; done
+
+# Spawn workers.
+WORKER_PIDS=()
+for w in $(seq 0 $((WORKERS - 1))); do
+  worker_loop "$w" &
+  WORKER_PIDS+=($!)
+done
+
+# Render at ~10 Hz until all workers exit, then one final frame.
+while true; do
+  render_frame
+  alive=0
+  for pid in "${WORKER_PIDS[@]}"; do
+    if kill -0 "$pid" 2>/dev/null; then alive=1; break; fi
+  done
+  (( alive == 0 )) && break
+  sleep 0.1
+done
+render_frame
+wait || true
+
+if [[ -s "$SKIPPED_FILE" ]]; then
+  echo
+  echo "Skipped (xcur2png could not read):"
+  sed 's/^/  /' "$SKIPPED_FILE"
+fi
+
+if (( APPLY )) && command -v gsettings >/dev/null; then
+  # Remember the previously-active theme so --reset can restore it. Only save
+  # when the current value isn't already YaruRecolored — otherwise re-applies
+  # would clobber the original value with our own theme name.
+  current_theme=$(gsettings get org.gnome.desktop.interface cursor-theme | tr -d "'")
+  if [[ "$current_theme" != "YaruRecolored" ]]; then
+    printf '%s\n' "$current_theme" > "$TARGET_DIR/.previous-theme"
+  fi
+  # Force GNOME to reload: gsettings won't trigger a refresh if the value is
+  # unchanged, so toggle through Adwaita and back.
+  gsettings set org.gnome.desktop.interface cursor-theme Adwaita
+  sleep 1
+  gsettings set org.gnome.desktop.interface cursor-theme YaruRecolored
+  prev=$(cat "$TARGET_DIR/.previous-theme" 2>/dev/null || echo Yaru)
+  echo
+  echo "Done — cursor theme YaruRecolored applied."
+  echo "(Run 'yaru-recolor --reset' to revert to '$prev'.)"
+else
+  echo
+  if (( APPLY )); then
+    echo "Done. gsettings not found; apply manually:"
+  else
+    echo "Done (--no-apply). To pick up changes, run:"
+  fi
+  echo "  gsettings set org.gnome.desktop.interface cursor-theme Adwaita"
+  echo "  sleep 1"
+  echo "  gsettings set org.gnome.desktop.interface cursor-theme YaruRecolored"
+  echo "(Toggle through Adwaita forces a reload even if YaruRecolored is already selected.)"
+fi

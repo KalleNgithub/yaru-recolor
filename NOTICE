@@ -1,0 +1,15 @@
+This package bundles the cursor source PNGs from the Yaru theme under
+yaru-sources/. They were extracted from /usr/share/icons/Yaru/cursors on
+Ubuntu 24.04 using xcur2png.
+
+Yaru is © its authors and is dual-licensed:
+- The icons (including these cursors) under Creative Commons Attribution-
+  ShareAlike 4.0 International (CC BY-SA 4.0).
+- The remainder of the theme under the GNU Lesser General Public License v3.0.
+
+Upstream:  https://github.com/ubuntu/yaru
+License:   https://github.com/ubuntu/yaru/blob/master/COPYING
+
+Redistribution of the bundled PNGs is covered by CC BY-SA 4.0. Modifications
+made by yaru-recolor at runtime are not committed back to this tarball;
+each user's recolored output lives in their own ~/.icons/YaruRecolored.
