@@ -7,26 +7,16 @@ GNOME — see below for other desktops).
 
 ## Install
 
-Run from the unpacked `yaru-recolor/` directory, one line at a time:
-
 ```bash
-sudo apt install -y imagemagick x11-apps
-install -m 0755 ./yaru-recolor ~/.local/bin/
-mkdir -p ~/.local/share/yaru-recolor
-cp -r ./yaru-sources ~/.local/share/yaru-recolor/
+git clone https://github.com/KalleNgithub/yaru-recolor.git
+cd yaru-recolor
+./install.sh
 ```
 
-That's it. `imagemagick` gives `convert`, `x11-apps` gives
-`xcursorgen`. The bundled `yaru-sources/` (extracted Yaru cursor PNGs +
-.conf files) is copied to `~/.local/share/yaru-recolor/` where the
-script finds them at runtime — no `xcur2png`, no source builds, no
-`yaru-theme-icon` package required.
-
-If `yaru-recolor` isn't on your PATH after install, add `~/.local/bin`:
-
-```bash
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
-```
+That's it. The script installs dependencies (`imagemagick`, `x11-apps`),
+copies the script to `~/.local/bin/` and the cursor sources to
+`~/.local/share/yaru-recolor/`. Do not run with `sudo` — it asks for
+your password only for the `apt install` step.
 
 ## First run
 
