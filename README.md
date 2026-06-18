@@ -16,7 +16,7 @@ mkdir -p ~/.local/share/yaru-recolor
 cp -r ./yaru-sources ~/.local/share/yaru-recolor/
 ```
 
-That's it. `imagemagick` gives `convert`/`mogrify`, `x11-apps` gives
+That's it. `imagemagick` gives `convert`, `x11-apps` gives
 `xcursorgen`. The bundled `yaru-sources/` (extracted Yaru cursor PNGs +
 .conf files) is copied to `~/.local/share/yaru-recolor/` where the
 script finds them at runtime — no `xcur2png`, no source builds, no
@@ -46,10 +46,12 @@ yaru-recolor --help     # all options
 yaru-recolor --colors   # palette of suggested fill+border combos
 ```
 
-Five color slots: `fill`, `border`, `highlight`, `shading`, `shadow`. You can
-pass any subset; the rest are auto-derived from `fill` + `border`. The
-`shading` and `shadow` slots are for the semi-transparent pixels (interior
-shadow effect + drop shadow respectively).
+Five color slots: `fill`, `border`, `highlight`, `shadow`. You can pass any
+subset; the rest keep the original Yaru value or are auto-derived from
+`fill` + `border`. All pixels (including anti-aliased edges) are smoothly
+recolored via a gradient map — no fuzz gaps.
+
+(`shading` is accepted as a deprecated alias for `shadow`.)
 
 ## Revert
 
@@ -64,7 +66,7 @@ recolored theme directory — re-applying is fast.
 ## Example: shiny gold
 
 ```bash
-yaru-recolor fill='#FFD700' border='#7A5008' highlight='#FFF8DC' shading='#8B5A2B' shadow='#2E1F00'
+yaru-recolor fill='#FFD700' border='#7A5008' highlight='#FFF8DC'
 ```
 
 ## Debian notes

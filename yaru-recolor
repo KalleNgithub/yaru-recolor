@@ -18,24 +18,24 @@ Output theme:  ~/.icons/YaruRecolored
 Apply with:    gsettings set org.gnome.desktop.interface cursor-theme YaruRecolored
 
 Color slots:
-  fill       opaque dark-gray cursor body (matches Yaru's #313131 gradient)
-  border     opaque black outline
-  highlight  opaque near-white edge accent on the cursor body
-  shading    interior dark shadow effect (semi-transparent, alpha >= 128)
-  shadow     drop shadow around the cursor (semi-transparent, alpha < 128)
+  fill       cursor body (maps from Yaru's #313131 gradient midpoint)
+  border     outline (maps from Yaru's black)
+  highlight  light edge accent (maps from Yaru's white)
+  shadow     drop shadow & anti-aliased edges near the border
+             (semi-transparent; only visible on light backgrounds)
+  shading    (deprecated alias for shadow — kept for compatibility)
+
+  All five slots are mapped through a smooth gradient CLUT based on the
+  original pixel luminance. Anti-aliasing and gradient pixels are covered
+  seamlessly — no fuzz gaps.
 
 Auto-defaults when a slot is omitted (computed once, before processing):
   highlight  is set to  fill blended 30% toward white
   shadow     is set to  border
-  shading    is set to  the resolved shadow value
-             (so shading ends up matching shadow unless you set shading
-              explicitly; if you set neither shading nor shadow, both fall
-              through to border)
 
-  Any slot still empty after these defaults is left untouched in the cursor.
-  Example: if you pass only fill=#FF1493, border stays Yaru's black, shadow
-  stays unchanged (because border wasn't set), highlight becomes the
-  lightened pink, shading stays unchanged.
+  Any slot still empty after these defaults uses the original Yaru value.
+  Example: if you pass only fill=#FF1493, border stays black, highlight
+  becomes a lightened pink, and shadow stays black.
 
 Other flags:
   --colors      print a palette of suggested fill+border combos
@@ -71,7 +71,6 @@ discover_source_dir() {
 }
 SOURCE_DIR="$(discover_source_dir)"
 TARGET_DIR="$HOME/.icons/YaruRecolored"
-FUZZ="10%"
 
 FILL=""
 BORDER=""
@@ -163,15 +162,15 @@ validate_hex shading   "$SHADING"
 validate_hex shadow    "$SHADOW"
 
 # Auto-derive any unset secondary colors from fill+border.
-# Order matters: SHADOW resolves before SHADING (since SHADING falls back to SHADOW).
 if [[ -z "$HIGHLIGHT" && -n "$FILL" ]]; then
   HIGHLIGHT="$(mix_hex 0.3 "$FILL" "#FFFFFF")"  # 30% fill + 70% white
 fi
 if [[ -z "$SHADOW" && -n "$BORDER" ]]; then
   SHADOW="$BORDER"
 fi
-if [[ -z "$SHADING" ]]; then
-  SHADING="${SHADOW:-${BORDER:-}}"
+# Shading is a deprecated alias — fold into shadow.
+if [[ -n "$SHADING" && -z "$SHADOW" ]]; then
+  SHADOW="$SHADING"
 fi
 
 # Default workers: nproc capped at 8 (more than that = diminishing returns
@@ -187,7 +186,7 @@ if [[ -z "$FILL" && -z "$BORDER" && -z "$HIGHLIGHT" && -z "$SHADING" && -z "$SHA
   exit 1
 fi
 
-for tool in xcursorgen mogrify; do
+for tool in xcursorgen convert; do
   command -v "$tool" >/dev/null || { echo "Missing: $tool" >&2; exit 1; }
 done
 
@@ -208,18 +207,41 @@ fi
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
-# CLUT for shadow tinting. Built once at top level (not in cursor dirs, where the
-# glob `*.png` would otherwise pick it up alongside the cursor PNGs). Positions
-# 0-127 map to SHADOW, 128-255 map to SHADING.
-CLUT_PATH=""
-if [[ -n "$SHADING" || -n "$SHADOW" ]]; then
-  CLUT_PATH="$WORK_DIR/_clut.png"
-  CLUT_SH="${SHADING:-${SHADOW:-#000000}}"
-  CLUT_LO="${SHADOW:-${SHADING:-#000000}}"
+# Build gradient CLUTs for the luminance-to-color mapping. Yaru cursors are
+# pure grayscale, so we map the original luminance smoothly through a color
+# gradient. This eliminates anti-aliasing artifacts that the old discrete
+# -opaque approach left behind.
+#
+# The Yaru palette maps roughly as:
+#   luminance   0 (#000000) = border (outline)
+#   luminance  49 (#313131) = fill (body)
+#   luminance 255 (#FFFFFF) = highlight (edge accent)
+#
+# Unset slots fall back to the original Yaru value so unspecified colors are
+# preserved in the output.
+
+CLUT_BORDER="${BORDER:-#000000}"
+CLUT_FILL="${FILL:-#313131}"
+CLUT_HIGHLIGHT="${HIGHLIGHT:-#FFFFFF}"
+
+# Opaque-pixel CLUT: border(0) → fill(49) → highlight(255)
+CLUT_OPAQUE="$WORK_DIR/_clut_opaque.png"
+convert \
+  \( -size 50x1 gradient:"$CLUT_BORDER"-"$CLUT_FILL" \) \
+  \( -size 206x1 gradient:"$CLUT_FILL"-"$CLUT_HIGHLIGHT" \) \
+  +append "$CLUT_OPAQUE"
+
+# Semi-transparent-pixel CLUT: shadow(0) → fill(49) → highlight(255)
+# This ensures anti-aliased edges of each region blend into the correct color,
+# and the drop-shadow pixels (luminance 0, low alpha) pick up the shadow color.
+CLUT_SHADOW_COLOR="${SHADOW:-${BORDER:-#000000}}"
+CLUT_SEMI=""
+if [[ "$CLUT_SHADOW_COLOR" != "$CLUT_BORDER" ]]; then
+  CLUT_SEMI="$WORK_DIR/_clut_semi.png"
   convert \
-    \( -size 128x1 xc:"$CLUT_LO" \) \
-    \( -size 128x1 xc:"$CLUT_SH" \) \
-    +append "$CLUT_PATH"
+    \( -size 50x1 gradient:"$CLUT_SHADOW_COLOR"-"$CLUT_FILL" \) \
+    \( -size 206x1 gradient:"$CLUT_FILL"-"$CLUT_HIGHLIGHT" \) \
+    +append "$CLUT_SEMI"
 fi
 
 mkdir -p "$TARGET_DIR/cursors"
@@ -297,48 +319,36 @@ process_cursor() {
   local conf="$cdir/$name.conf"
   [[ -f "$conf" ]] || { echo "$name" >> "$SKIPPED_FILE"; return; }
 
-  # Pass 1: opaque-pixel recolors. Yaru's opaque palette:
-  #   border    = #000000  (outline)
-  #   fill      = #313131  (dark-gray body gradient; fuzz=10% catches the gradient)
-  #   highlight = near-white edge accent
-  # -opaque matches RGBA exactly, so semi-transparent #000000 shadow pixels
-  # are NOT touched here even though they share the border's RGB.
-  local -a mogrify_args=(-fuzz "$FUZZ")
-  [[ -n "$BORDER"    ]] && mogrify_args+=(-fill "$BORDER"    -opaque black)
-  [[ -n "$FILL"      ]] && mogrify_args+=(-fill "$FILL"      -opaque '#313131')
-  [[ -n "$HIGHLIGHT" ]] && mogrify_args+=(-fill "$HIGHLIGHT" -opaque white)
-  mogrify "${mogrify_args[@]}" "$cdir"/*.png
-
-  # Pass 2: semi-transparent shadow recolor. Yaru's drop shadow and interior
-  # shading are both pure-black pixels with alpha in (0,255). Pass 1 leaves
-  # them alone (RGB still #000000). Here we split by alpha:
-  #   alpha 128-254 → SHADING (interior darker patches)
-  #   alpha   1-127 → SHADOW  (outer drop shadow)
-  # via a 256x1 CLUT applied to the alpha channel, then masked to only the
-  # pixels that are currently #000000 with alpha<255 (i.e. originally shadow).
-  if [[ -n "$CLUT_PATH" ]]; then
-    for png in "$cdir"/*.png; do
-      tint_shadow "$png" "$CLUT_PATH"
-    done
-  fi
+  # Recolor every PNG via gradient CLUT. Since all Yaru cursor pixels are
+  # grayscale (R=G=B), we map luminance through the color gradient and
+  # preserve the original alpha channel. This covers the full tonal range
+  # including anti-aliased edge pixels that the old -opaque approach missed.
+  for png in "$cdir"/*.png; do
+    if [[ -n "$CLUT_SEMI" ]]; then
+      # Two CLUTs: opaque pixels get border→fill→highlight,
+      # semi-transparent pixels get shadow→fill→highlight.
+      convert "$png" \
+        \( +clone -alpha extract \) \
+        \( -clone 0 -alpha off "$CLUT_OPAQUE" -clut \) \
+        \( -clone 0 -alpha off "$CLUT_SEMI" -clut \) \
+        \( -clone 1 -threshold 99.5% \) \
+        \( -clone 2 -clone 4 -alpha off -compose CopyOpacity -composite \) \
+        \( -clone 3 -clone 5 -compose Over -composite \) \
+        \( -clone 6 -alpha off -clone 1 -compose CopyOpacity -composite \) \
+        -delete 0-6 \
+        "$png"
+    else
+      # Single CLUT: same color mapping for all pixels.
+      convert "$png" \
+        \( +clone -alpha extract \) \
+        \( -clone 0 -alpha off "$CLUT_OPAQUE" -clut \) \
+        -delete 0 +swap \
+        -compose CopyOpacity -composite \
+        "$png"
+    fi
+  done
 
   ( cd "$cdir" && xcursorgen "$conf" "$TARGET_DIR/cursors/$name" )
-}
-
-# Tint semi-transparent #000000 pixels in $1 using the alpha-keyed CLUT in $2.
-# Preserves each pixel's original alpha and leaves opaque pixels untouched.
-tint_shadow() {
-  local png="$1" clut="$2"
-  convert "$png" \
-    \( +clone -channel A -separate +channel \) \
-    \( -clone 1 "$clut" -clut \) \
-    \( -clone 0 -alpha off -fuzz 1% -fill white -opaque black -fill black +opaque white \) \
-    \( -clone 1 -threshold 99% -negate \) \
-    \( -clone 3 -clone 4 -alpha off -compose multiply -composite \) \
-    \( -clone 2 -clone 5 -alpha off -compose CopyOpacity -composite \) \
-    \( -clone 0 -clone 6 -compose Atop -composite \) \
-    -delete 0-6 \
-    "$png"
 }
 
 worker_loop() {
