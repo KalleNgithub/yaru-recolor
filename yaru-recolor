@@ -10,7 +10,7 @@ yaru-recolor — rebuild Yaru cursors with custom colors.
 Usage:
   yaru-recolor [fill=#RRGGBB] [border=#RRGGBB] [highlight=#RRGGBB]
                [shading=#RRGGBB] [shadow=#RRGGBB]
-               [--workers=N] [--no-apply] [--colors] [-h|--help]
+               [--workers=N] [--no-apply] [--snap] [--colors] [-h|--help]
 
 Source PNGs:   bundled `yaru-sources/` (see README); override with
                $YARU_RECOLOR_SOURCES if you want a custom path.
@@ -41,9 +41,30 @@ Other flags:
   --colors      print a palette of suggested fill+border combos
   --workers=N   parallel workers (default: min(nproc, 8))
   --no-apply    don't run gsettings to switch the active theme
-  --reset       restore the cursor theme to whatever was active before the
-                last apply (or 'Yaru' if no prior value was saved). Does not
-                rebuild or delete the YaruRecolored theme directory.
+  --snap        also make strict-confinement snap apps (Firefox, Thunderbird,
+                Discord, ...) use the recolor. Patches the installed
+                gtk-common-themes snap and your system Yaru cursor theme in
+                place via a systemd drop-in on its mount unit (survives
+                reboots automatically), then switches the active theme to
+                plain 'Yaru' (see "Snap apps" in the README for why). Needs
+                sudo.
+                If you don't pass this, you'll be asked about it once
+                interactively (skipped on non-snap systems); after you say
+                yes once, it becomes sticky and auto-applies on every future
+                recolor without asking again.
+  --snap-reapply  rarely needed: reinstall the mount-unit override from a
+                previous --snap run (e.g. if it was manually removed).
+                Doesn't rebuild the theme; not part of normal operation.
+  --reset       undo everything this tool has done: restores the cursor
+                theme to whatever was active before the last apply (or
+                'Yaru' if no prior value was saved), AND fully undoes --snap
+                patching if it was ever used (restores the original
+                gtk-common-themes mount and host Yaru cursors) — you never
+                need a separate command for that. Does not rebuild or delete
+                the YaruRecolored theme directory.
+  --uninstall   full removal: does everything --reset does, then also
+                deletes the generated theme, cached snap-patch data, and
+                this script itself. One command, nothing left behind.
   -h, --help    this message
 HELP
 }
@@ -78,7 +99,234 @@ HIGHLIGHT=""
 SHADING=""
 SHADOW=""
 APPLY=1
+SNAP=0
 WORKERS=""
+
+# --- snap app support -------------------------------------------------------
+# Strict-confinement snaps (Firefox, Thunderbird, Discord, ...) get their
+# cursor/icon themes from the gtk-common-themes snap via the content
+# interface, not from ~/.icons or /usr/share/icons. That snap's icon-themes
+# slot exports a *fixed, hardcoded* list of theme names baked into its
+# meta/snap.yaml — 'YaruRecolored' isn't on it, but 'Yaru' is. So instead of
+# adding a new theme, we overwrite Yaru's own cursor files (in both the
+# gtk-common-themes snap and the host's /usr/share/icons/Yaru) with our
+# recolor, then point cursor-theme at plain 'Yaru'.
+SNAP_STATE_DIR="$HOME/.local/share/yaru-recolor/snap-patch"
+SNAP_STATE_FILE="$SNAP_STATE_DIR/state"
+SNAP_SQUASHFS="$SNAP_STATE_DIR/gtk-common-themes-custom.squashfs"
+HOST_YARU_CURSORS="/usr/share/icons/Yaru/cursors"
+HOST_YARU_BACKUP="/usr/share/icons/Yaru/cursors.orig-backup"
+
+require_snap() {
+  command -v snap >/dev/null || { echo "snap not found; --snap requires snapd." >&2; exit 1; }
+  snap list gtk-common-themes >/dev/null 2>&1 || {
+    echo "gtk-common-themes snap not installed; nothing to patch." >&2; exit 1; }
+}
+
+snap_gtk_common_themes_rev() { readlink /snap/gtk-common-themes/current; }
+
+# Run a privileged command: via sudo normally, or directly if we're already
+# root.
+run_priv() {
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+# Bounce the cursor-theme gsettings key to force already-running GTK apps to
+# reload cursor bitmaps. Best-effort: silently skipped if there's no GNOME
+# session to talk to.
+bounce_cursor_theme() {
+  command -v gsettings >/dev/null || return 0
+  gsettings set org.gnome.desktop.interface cursor-theme Adwaita 2>/dev/null || return 0
+  sleep 1
+  gsettings set org.gnome.desktop.interface cursor-theme Yaru 2>/dev/null || true
+}
+
+# The exact systemd unit name snapd auto-generates for a given revision's
+# mount, e.g. "snap-gtk\x2dcommon\x2dthemes-1535.mount".
+snap_mount_unit_name() {
+  local rev="$1"
+  printf 'snap-%s-%s.mount' "$(systemd-escape gtk-common-themes)" "$rev"
+}
+
+# Point that unit's own "What=" at our custom squashfs via a systemd drop-in,
+# instead of raw-mounting over it. This matters: gtk-common-themes' mount is
+# itself a systemd .mount unit (ordered before snapd.mounts.target), which
+# other snaps' services pull in as a dependency. A bare `mount` bypasses
+# systemd's own bookkeeping for that unit, so the next time anything
+# re-triggers snapd.mounts.target (e.g. another snap's background service
+# starting, which happens routinely within the first minute after boot),
+# systemd can restart the unit back to ITS OWN definition — silently
+# reverting our raw mount within seconds, without ever calling our script.
+# Overriding "What=" through a real drop-in makes our squashfs the unit's
+# actual, authoritative definition, so systemd enforces it instead of
+# fighting it — and it survives reboots for the same reason, with no need
+# for a separate boot-time service of our own.
+install_snap_mount_override() {
+  local rev="$1" unit; unit="$(snap_mount_unit_name "$rev")"
+  run_priv mkdir -p "/etc/systemd/system/$unit.d"
+  run_priv tee "/etc/systemd/system/$unit.d/99-yaru-recolor.conf" >/dev/null <<EOF
+[Mount]
+What=$SNAP_SQUASHFS
+EOF
+  run_priv systemctl daemon-reload
+  run_priv systemctl restart "$unit"
+}
+
+# Undo install_snap_mount_override: remove the drop-in so the unit's own
+# "What=" reverts to snapd's original .snap blob.
+remove_snap_mount_override() {
+  local rev="$1" unit; unit="$(snap_mount_unit_name "$rev")"
+  run_priv rm -f "/etc/systemd/system/$unit.d/99-yaru-recolor.conf"
+  run_priv rmdir "/etc/systemd/system/$unit.d" 2>/dev/null || true
+  run_priv systemctl daemon-reload
+  run_priv systemctl restart "$unit" 2>/dev/null || true
+}
+
+# Discard the persistent per-snap mount namespace for every snap connected to
+# gtk-common-themes:icon-themes, so their next launch picks up fresh mounts
+# instead of reusing a stale namespace from before the patch.
+#
+# Discarding the namespace alone is NOT enough for apps that are still
+# running: a bind mount doesn't follow if the underlying master mount gets
+# swapped later, so an already-running snap can keep pointing at a loop
+# device backing an old (even deleted) squashfs generation indefinitely,
+# regardless of namespace discards done afterwards. Also, some snaps (e.g.
+# Discord with --use-tray-icon) stay resident after their window is closed,
+# so "closing" them doesn't actually stop the process. To guarantee a clean
+# pickup, force-kill every running process of each connected snap too — but
+# ask for confirmation first, since this closes the user's windows/apps
+# without saving anything. No need to check whether anything's actually
+# running: if nothing is, the kill is simply a no-op.
+discard_snap_namespaces() {
+  local apps
+  apps="$(snap connections 2>/dev/null | awk '/gtk-common-themes:icon-themes/{print $2}' | cut -d: -f1 | sort -u)"
+  [[ -z "$apps" ]] && return 0
+  echo "Discarding stale mount namespaces for connected snaps: $apps"
+
+  local do_kill=1
+  if [[ -t 0 && -t 1 ]]; then
+    read -r -p "Close any of these that are currently running (Firefox, Thunderbird, Discord, ...) so they pick up the patch on next launch? [y/N] " kill_ans
+    [[ "$kill_ans" =~ ^[Yy]$ ]] || do_kill=0
+  fi
+
+  local app
+  for app in $apps; do
+    run_priv /usr/lib/snapd/snap-discard-ns "$app" 2>/dev/null || true
+    if (( do_kill )); then
+      pkill -9 -f "/snap/$app/" 2>/dev/null || true
+    fi
+  done
+  echo "Relaunch those apps to pick up the change."
+}
+
+# Build a patched gtk-common-themes squashfs from $TARGET_DIR/cursors and
+# mount it in place of the installed snap's content, plus patch the host
+# Yaru theme the same way. Requires $TARGET_DIR/cursors to already exist.
+apply_snap_patch() {
+  require_snap
+  command -v mksquashfs >/dev/null || { echo "Installing squashfs-tools..."; run_priv apt install -y squashfs-tools; }
+  [[ -d "$TARGET_DIR/cursors" ]] || {
+    echo "No recolored cursors found at $TARGET_DIR/cursors — run without --no-apply first." >&2
+    exit 1
+  }
+
+  local rev; rev="$(snap_gtk_common_themes_rev)"
+  if [[ ! "$rev" =~ ^[0-9]+$ ]]; then
+    cat >&2 <<EOF
+gtk-common-themes is in an unexpected state (revision '$rev', expected a
+plain number). If a previous 'snap try' is still active, run:
+  sudo snap revert gtk-common-themes
+and try again.
+EOF
+    exit 1
+  fi
+
+  echo "Patching gtk-common-themes (rev $rev) for snap apps..."
+  mkdir -p "$SNAP_STATE_DIR"
+  local work="$SNAP_STATE_DIR/gtk-common-themes-src"
+  rm -rf "$work"
+  run_priv cp -a "/snap/gtk-common-themes/$rev" "$work"
+  run_priv chown -R "$(id -u):$(id -g)" "$work"
+  cp -a "$TARGET_DIR/cursors/." "$work/share/icons/Yaru/cursors/"
+
+  mksquashfs "$work" "$SNAP_SQUASHFS.new" -no-progress -comp xz -all-root >/dev/null
+  mv -f "$SNAP_SQUASHFS.new" "$SNAP_SQUASHFS"
+  rm -rf "$work"
+
+  # Back up the host Yaru cursors once (never overwritten again), then
+  # overwrite the live copy with the recolor.
+  if [[ ! -d "$HOST_YARU_BACKUP" ]]; then
+    run_priv cp -a "$HOST_YARU_CURSORS" "$HOST_YARU_BACKUP"
+  fi
+  run_priv cp -a "$TARGET_DIR/cursors/." "$HOST_YARU_CURSORS/"
+
+  run_priv snap refresh --hold=forever gtk-common-themes >/dev/null
+  install_snap_mount_override "$rev"
+
+  printf 'rev=%s\n' "$rev" > "$SNAP_STATE_FILE"
+
+  # Snap apps can only see the theme name 'Yaru' (see comment above), so that
+  # has to be the one true active theme name once --snap is used.
+  bounce_cursor_theme
+
+  discard_snap_namespaces
+
+  echo
+  echo "Done — snap apps (Firefox, Thunderbird, Discord, ...) now use the recolor."
+  echo "This is done via a systemd drop-in on gtk-common-themes' own mount unit,"
+  echo "so it survives reboots automatically — no extra steps needed."
+}
+
+# Re-apply the drop-in from a previous --snap run (e.g. if it was manually
+# removed, or gtk-common-themes' revision changed). Does not rebuild anything.
+reapply_snap_patch() {
+  require_snap
+  [[ -f "$SNAP_SQUASHFS" ]] || {
+    echo "No cached snap patch found; run 'yaru-recolor --snap' (with colors) first." >&2
+    exit 1
+  }
+  local rev; rev="$(snap_gtk_common_themes_rev)"
+  echo "Reinstalling mount override for gtk-common-themes (rev $rev)..."
+  run_priv snap refresh --hold=forever gtk-common-themes >/dev/null
+  install_snap_mount_override "$rev"
+  printf 'rev=%s\n' "$rev" > "$SNAP_STATE_FILE"
+
+  bounce_cursor_theme
+
+  discard_snap_namespaces
+  echo "Done."
+}
+
+# Undo apply_snap_patch: remove the mount-unit override (restoring the
+# original gtk-common-themes mount) and the host Yaru cursors from backup.
+# Leaves gsettings alone (theme stays 'Yaru', which is now stock again since
+# the host cursors were restored) — do_reset() below handles gsettings.
+# No-ops silently if --snap was never used (no state file), so it's always
+# safe for do_reset() to call this unconditionally: users shouldn't have to
+# know or care whether snap patching happened when they just want to reset
+# the whole tool with one command.
+reset_snap_patch() {
+  [[ -f "$SNAP_STATE_FILE" ]] || return 0
+  echo "Reverting snap patch..."
+  local rev; rev="$(sed -n 's/^rev=//p' "$SNAP_STATE_FILE")"
+  if [[ -n "$rev" ]]; then
+    remove_snap_mount_override "$rev"
+  else
+    echo "Warning: no revision recorded; run 'sudo snap revert gtk-common-themes' manually if needed." >&2
+  fi
+  if [[ -d "$HOST_YARU_BACKUP" ]]; then
+    run_priv rm -rf "$HOST_YARU_CURSORS"
+    run_priv cp -a "$HOST_YARU_BACKUP" "$HOST_YARU_CURSORS"
+  fi
+  run_priv snap refresh --unhold gtk-common-themes >/dev/null 2>&1 || true
+  discard_snap_namespaces
+  rm -f "$SNAP_STATE_FILE"
+  echo "Snap patch reverted."
+}
 
 # 24-bit ANSI color swatch: "   " (3 spaces) with hex background.
 swatch() {
@@ -117,6 +365,11 @@ EOF
 }
 
 do_reset() {
+  # Undo any --snap patching first (silently no-ops if it was never used) —
+  # --reset means "undo everything this tool did", full stop. Users
+  # shouldn't need a separate command to know about or clean up snap
+  # internals.
+  reset_snap_patch
   if ! command -v gsettings >/dev/null; then
     echo "gsettings not found; can't reset (not on a GNOME-y desktop?)." >&2
     exit 1
@@ -125,8 +378,38 @@ do_reset() {
   if [[ -r "$prev_file" ]]; then
     prev="$(cat "$prev_file")"
   fi
+  # Always force a real repaint, even if $prev equals the theme name that's
+  # already set. This matters whenever --snap was used: it keeps the theme
+  # name as plain 'Yaru' both while patched and after reset (only the cursor
+  # *files* on disk change back to stock), so setting cursor-theme to the
+  # same value again is a no-op as far as gsettings/GTK is concerned — they
+  # only reload cursor bitmaps on an actual value transition, not just
+  # because the underlying files changed. Bouncing through a throwaway value
+  # first guarantees a real transition every time.
+  gsettings set org.gnome.desktop.interface cursor-theme Adwaita
+  sleep 1
   gsettings set org.gnome.desktop.interface cursor-theme "$prev"
   echo "Cursor theme reset to '$prev'."
+}
+
+# Full removal: reset (theme + any --snap patching), then delete every file
+# this tool ever created, including itself. One command, no manual steps or
+# "figure out where I installed things" guesswork.
+do_uninstall() {
+  do_reset
+  echo
+  echo "Removing installed files..."
+  rm -rf "$TARGET_DIR" "$SNAP_STATE_DIR"
+  rmdir "$(dirname "$SNAP_STATE_DIR")" 2>/dev/null || true
+  local self; self="$(readlink -f "${BASH_SOURCE[0]}")"
+  local src_dir="$HOME/.local/share/yaru-recolor/yaru-sources"
+  [[ -d "$src_dir" ]] && rm -rf "$src_dir"
+  echo "Removed: $TARGET_DIR"
+  echo "Removed: $SNAP_STATE_DIR"
+  [[ -d "$src_dir" ]] || echo "Removed: $src_dir"
+  echo "Removing script: $self"
+  rm -f "$self"
+  echo "Uninstalled."
 }
 
 for arg in "$@"; do
@@ -138,8 +421,11 @@ for arg in "$@"; do
     shadow=*)    SHADOW="${arg#shadow=}" ;;
     --workers=*) WORKERS="${arg#--workers=}" ;;
     --no-apply)  APPLY=0 ;;
+    --snap)      SNAP=1 ;;
+    --snap-reapply) reapply_snap_patch; exit 0 ;;
     --colors)    show_palette; exit 0 ;;
     --reset)     do_reset; exit 0 ;;
+    --uninstall) do_uninstall; exit 0 ;;
     -h|--help)   show_help; exit 0 ;;
     *) echo "Unknown arg: $arg" >&2; exit 1 ;;
   esac
@@ -185,6 +471,10 @@ if [[ -z "$FILL" && -z "$BORDER" && -z "$HIGHLIGHT" && -z "$SHADING" && -z "$SHA
   echo "Usage: $(basename "$0") [fill=#RRGGBB] [border=#RRGGBB] [highlight=#RRGGBB] [shading=#RRGGBB] [shadow=#RRGGBB]" >&2
   exit 1
 fi
+
+# Fail fast on missing snapd/gtk-common-themes before doing the (slow)
+# recolor work below.
+(( SNAP )) && require_snap
 
 for tool in xcursorgen convert; do
   command -v "$tool" >/dev/null || { echo "Missing: $tool" >&2; exit 1; }
@@ -419,23 +709,49 @@ if [[ -s "$SKIPPED_FILE" ]]; then
   sed 's/^/  /' "$SKIPPED_FILE"
 fi
 
+# Sticky: if --snap was used successfully before, keep patching snap apps on
+# every subsequent recolor without having to pass --snap again. Gated on
+# APPLY so --no-apply always stays a pure "just regenerate files" no-op.
+if (( ! SNAP )) && (( APPLY )) && [[ -f "$SNAP_STATE_FILE" ]]; then
+  SNAP=1
+fi
+
+# Discoverability: --snap is easy to miss in --help, so offer it the first
+# time, on systems where it's actually relevant. Silent no-op for
+# non-interactive runs or systems without snapd/gtk-common-themes.
+if (( ! SNAP )) && (( APPLY )) && [[ -t 0 && -t 1 ]] \
+   && command -v snap >/dev/null 2>&1 \
+   && snap list gtk-common-themes >/dev/null 2>&1; then
+  read -r -p "Also patch strict-confinement snap apps (Firefox, Thunderbird, Discord, ...) so they use this recolor too? Needs sudo; closes any of them that are currently running. [y/N] " snap_ans
+  [[ "$snap_ans" =~ ^[Yy]$ ]] && SNAP=1
+fi
+
 if (( APPLY )) && command -v gsettings >/dev/null; then
   # Remember the previously-active theme so --reset can restore it. Only save
-  # when the current value isn't already YaruRecolored — otherwise re-applies
+  # when the current value isn't already one of our own theme names ('Yaru'
+  # is ours too whenever --snap patching is active) — otherwise re-applies
   # would clobber the original value with our own theme name.
   current_theme=$(gsettings get org.gnome.desktop.interface cursor-theme | tr -d "'")
-  if [[ "$current_theme" != "YaruRecolored" ]]; then
+  if [[ "$current_theme" != "YaruRecolored" ]] && \
+     ! { [[ "$current_theme" == "Yaru" && -f "$SNAP_STATE_FILE" ]]; }; then
     printf '%s\n' "$current_theme" > "$TARGET_DIR/.previous-theme"
   fi
-  # Force GNOME to reload: gsettings won't trigger a refresh if the value is
-  # unchanged, so toggle through Adwaita and back.
-  gsettings set org.gnome.desktop.interface cursor-theme Adwaita
-  sleep 1
-  gsettings set org.gnome.desktop.interface cursor-theme YaruRecolored
-  prev=$(cat "$TARGET_DIR/.previous-theme" 2>/dev/null || echo Yaru)
-  echo
-  echo "Done — cursor theme YaruRecolored applied."
-  echo "(Run 'yaru-recolor --reset' to revert to '$prev'.)"
+  if (( SNAP )); then
+    # --snap needs the active theme to be plain 'Yaru' (see apply_snap_patch
+    # for why), so skip switching to YaruRecolored here — apply_snap_patch
+    # does its own Adwaita-bounce-to-Yaru below.
+    apply_snap_patch
+  else
+    # Force GNOME to reload: gsettings won't trigger a refresh if the value is
+    # unchanged, so toggle through Adwaita and back.
+    gsettings set org.gnome.desktop.interface cursor-theme Adwaita
+    sleep 1
+    gsettings set org.gnome.desktop.interface cursor-theme YaruRecolored
+    prev=$(cat "$TARGET_DIR/.previous-theme" 2>/dev/null || echo Yaru)
+    echo
+    echo "Done — cursor theme YaruRecolored applied."
+    echo "(Run 'yaru-recolor --reset' to revert to '$prev'.)"
+  fi
 else
   echo
   if (( APPLY )); then
@@ -447,4 +763,5 @@ else
   echo "  sleep 1"
   echo "  gsettings set org.gnome.desktop.interface cursor-theme YaruRecolored"
   echo "(Toggle through Adwaita forces a reload even if YaruRecolored is already selected.)"
+  (( SNAP )) && apply_snap_patch
 fi
